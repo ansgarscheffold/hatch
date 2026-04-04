@@ -2,16 +2,7 @@
 
 **Hatch** is a native **SSH client for macOS** built with **SwiftUI**. It combines a server library, SSH key management, and a full **xterm-style terminal** (via embedded [XTerminalUI](https://github.com/Lakr233/XTerminalUI) / WebKit) backed by **[NSRemoteShell](Sources/NSRemoteShell)** (libssh2).
 
-### Project goal
-
 The idea behind Hatch is a **simple, native, and polished SSH server manager**: you **add your servers**, **keep them organized** in one place, and open a **full terminal session** right in the app—no detour through separate config files or extra tools for everyday work. The UI should feel at home on macOS while staying easy to use.
-
-### Security at a glance
-
-Sensitive data uses **two layers**:
-
-1. **macOS Keychain** — the app keeps a **master encryption key** in the Keychain (not your passwords as separate login items).  
-2. **Encrypted SQLite database** — **passwords**, **private keys**, and related secrets are stored **only in encrypted form** (AES-GCM) in the local database under Application Support.
 
 ---
 
