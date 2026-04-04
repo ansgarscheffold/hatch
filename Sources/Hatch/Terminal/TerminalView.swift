@@ -1,0 +1,752 @@
+import SwiftUI
+import XTerminalUI
+import NSRemoteShell
+import WebKit
+import AppKit
+
+// Custom shape for rounded corner only on bottom-right
+struct BottomRightRoundedRectangle: Shape {
+    var cornerRadius: CGFloat
+    
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        
+        // Start from top-left (sharp corner)
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        
+        // Top edge to top-right (sharp corner)
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        
+        // Right edge to bottom-right (before rounded corner)
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - cornerRadius))
+        
+        // Bottom-right rounded corner using arc
+        path.addArc(
+            center: CGPoint(x: rect.maxX - cornerRadius, y: rect.maxY - cornerRadius),
+            radius: cornerRadius,
+            startAngle: .degrees(0),
+            endAngle: .degrees(90),
+            clockwise: false
+        )
+        
+        // Bottom edge to bottom-left (sharp corner)
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        
+        // Left edge back to start (sharp corner)
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        
+        path.closeSubpath()
+        return path
+    }
+}
+
+/// Wenn die Sidebar (NSTableView etc.) den First Responder hält, erreichen Tasten die WKWebView nicht —
+/// wir leiten keyDown explizit an die WebView weiter (WebKit verarbeitet das im Inhalt).
+final class TerminalKeyboardBridge: ObservableObject {
+    private var monitor: Any?
+    private weak var webView: WKWebView?
+
+    func activate(webView: WKWebView, isTerminalActive: @escaping () -> Bool) {
+        deactivate()
+        self.webView = webView
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self,
+                  isTerminalActive(),
+                  let wv = self.webView,
+                  wv.window != nil
+            else { return event }
+            guard let win = event.window, win === wv.window, win.isKeyWindow else { return event }
+            if Self.isFirstResponderRelated(to: wv, window: win) {
+                return event
+            }
+            if Self.windowHasNativeTextEditingFocus(win) {
+                return event
+            }
+            win.makeFirstResponder(wv)
+            // Synchron: async kann Events unter WebKit verlieren; der Monitor läuft ohnehin auf dem Main-Thread.
+            wv.keyDown(with: event)
+            return nil
+        }
+    }
+
+    func deactivate() {
+        if let m = monitor {
+            NSEvent.removeMonitor(m)
+            monitor = nil
+        }
+        webView = nil
+    }
+
+    deinit { deactivate() }
+
+    /// True, wenn der First Responder die WebView selbst ist oder eine View **in** der WebView-Hierarchie (laut AppKit).
+    /// Nicht true, wenn nur der Container (`XTerminalView`) den Fokus hat — der leitet `keyDown` nicht weiter; dann
+    /// muss die Bridge `makeFirstResponder` + `keyDown` ausführen.
+    static func isFirstResponderRelated(to webView: WKWebView, window: NSWindow) -> Bool {
+        guard let frView = window.firstResponder as? NSView else {
+            return window.firstResponder === webView
+        }
+        return frView.isDescendant(of: webView)
+    }
+
+    private static func windowHasNativeTextEditingFocus(_ window: NSWindow) -> Bool {
+        guard let fr = window.firstResponder else { return false }
+        var c: AnyClass? = type(of: fr)
+        while let cls = c {
+            let n = NSStringFromClass(cls)
+            if n.contains("NSTextView") || n.contains("NSTextField") || n.contains("NSSearchField") {
+                return true
+            }
+            c = cls.superclass()
+        }
+        return false
+    }
+}
+
+final class TerminalSession: ObservableObject {
+    @Published var status: String = "idle"
+
+    let terminalView = STerminalView()
+    private var shell: NSRemoteShell = .init()
+    private var writeBuffer: String = ""
+    private let bufferLock = NSLock()
+
+    func start(host: String, port: Int, username: String, password: String?) {
+        status = "connecting"
+        terminalView
+            .setupBellChain {
+                // bell
+            }
+            .setupBufferChain { [weak self] buffer in
+                guard let self = self else { return }
+                self.bufferLock.lock()
+                self.writeBuffer += buffer
+                self.bufferLock.unlock()
+                self.shell.explicitRequestStatusPickup()
+            }
+            .setupTitleChain { _ in }
+            .setupSizeChain { _ in }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.shell.setupConnectionHost(host)
+                .setupConnectionPort(NSNumber(value: port))
+                .setupConnectionTimeout(NSNumber(value: 10))
+                .requestConnectAndWait()
+
+            guard self.shell.isConnected else {
+                DispatchQueue.main.async { self.status = "connect failed" }
+                return
+            }
+
+            if let pwd = password {
+                self.shell.authenticate(with: username, andPassword: pwd)
+            } else {
+                self.shell.authenticate(with: username, andPassword: "")
+            }
+
+            guard self.shell.isConnected, self.shell.isAuthenticated else {
+                DispatchQueue.main.async { self.status = "auth failed" }
+                return
+            }
+
+            DispatchQueue.main.async { self.status = "connected" }
+
+            self.shell.begin(withTerminalType: "xterm",
+                withOnCreate: {
+                    // noop
+                },
+                withTerminalSize: { [weak self] in
+                    // query terminal size
+                    if let size = self?.terminalView.requestTerminalSize() {
+                        return size
+                    }
+                    return CGSize(width: 80, height: 24)
+                },
+                withWriteDataBuffer: { [weak self] in
+                    guard let self = self else { return "" }
+                    self.bufferLock.lock()
+                    let copy = self.writeBuffer
+                    self.writeBuffer = ""
+                    self.bufferLock.unlock()
+                    return copy
+                },
+                withOutputDataBuffer: { [weak self] output in
+                    guard let self = self else { return }
+                    let sem = DispatchSemaphore(value: 0)
+                    DispatchQueue.main.async {
+                        self.terminalView.write(output)
+                        sem.signal()
+                    }
+                    sem.wait()
+                },
+                withContinuationHandler: { true }
+            )
+
+            DispatchQueue.main.async {
+                self.status = "shell closed"
+            }
+        }
+    }
+
+    func stop() {
+        shell.requestDisconnectAndWait()
+        status = "disconnected"
+    }
+}
+
+struct TerminalView: View {
+    @ObservedObject var manager: ConnectionManager
+    @ObservedObject private var settings = AppSettings.shared
+    // Move the state object to the view model or a higher level to persist it
+    @StateObject private var terminalHolder: TerminalHolder
+
+    init(manager: ConnectionManager) {
+        self.manager = manager
+        // Initialize with a new holder if not provided (this logic might need refinement for true persistence)
+        _terminalHolder = StateObject(wrappedValue: TerminalHolder())
+    }
+
+    // Custom init to allow passing an existing holder if needed
+    init(manager: ConnectionManager, holder: TerminalHolder) {
+        self.manager = manager
+        _terminalHolder = StateObject(wrappedValue: holder)
+    }
+
+    var body: some View {
+        TerminalViewInternal(manager: manager, terminalHolder: terminalHolder)
+            .padding(1)
+            .background(Color(settings.terminalTheme.backgroundColor))
+            .clipShape(BottomRightRoundedRectangle(cornerRadius: 4))
+    }
+}
+
+struct TerminalViewInternal: View {
+    @ObservedObject var manager: ConnectionManager
+    @ObservedObject var terminalHolder: TerminalHolder
+    @ObservedObject private var settings = AppSettings.shared
+    @StateObject private var keyboardBridge = TerminalKeyboardBridge()
+    @State private var lastTerminalFocusAt: Date = .distantPast
+
+    /// Immer die WebView dieser Terminal-Instanz — nie die erste beliebige WKWebView im App-Fenster.
+    private var terminalWKWebView: WKWebView {
+        terminalHolder.view.terminalWebView
+    }
+
+    var body: some View {
+        GeometryReader { r in
+            terminalHolder.view
+                .padding(8)
+                .frame(width: r.size.width, height: r.size.height)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(settings.terminalTheme.backgroundColor))
+                .contentShape(Rectangle())
+                .simultaneousGesture(
+                    TapGesture().onEnded {
+                        updateTerminalSetting("disableStdin", value: "false")
+                        focusTerminal()
+                    }
+                )
+                .onAppear {
+                        if !terminalHolder.isInitialized {
+                            setupTerminal()
+                            terminalHolder.isInitialized = true
+                        }
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            setTerminalTheme()
+                        }
+
+                        if manager.isConnected {
+                            DispatchQueue.main.async {
+                                manager.startInteractiveShell(with: terminalHolder.view)
+                                updateTerminalSetting("disableStdin", value: "false")
+                                keyboardBridge.activate(webView: terminalWKWebView) {
+                                    manager.isConnected
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    focusTerminal()
+                                }
+                            }
+                        }
+                    }
+                    .onChange(of: manager.isConnected) { connected in
+                        if connected {
+                            DispatchQueue.main.async {
+                                manager.startInteractiveShell(with: terminalHolder.view)
+                                updateTerminalSetting("disableStdin", value: "false")
+                                keyboardBridge.activate(webView: terminalWKWebView) {
+                                    manager.isConnected
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    focusTerminal()
+                                }
+                            }
+                        } else {
+                            keyboardBridge.deactivate()
+                        }
+                    }
+                    .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+                        guard manager.isConnected,
+                              let win = notification.object as? NSWindow,
+                              win === terminalWKWebView.window
+                        else { return }
+                        DispatchQueue.main.async {
+                            focusTerminal()
+                        }
+                    }
+                    .onDisappear {
+                        keyboardBridge.deactivate()
+                    }
+                    .onChange(of: settings.terminalTheme) { _ in
+                        // Update theme immediately when settings change
+                        // Try immediately first, then retry if needed
+                        if !setTerminalThemeInternal() {
+                            setTerminalThemeWithRetry(maxRetries: 3, delay: 0.1)
+                        }
+                    }
+                    .onChange(of: settings.terminalFontSize) { newSize in
+                        // Update font size via JavaScript once the terminal is ready
+                        updateTerminalSetting("fontSize", value: String(newSize))
+                    }
+                    .onChange(of: settings.terminalFontFamily) { newFamily in
+                        // Update font family via JavaScript
+                        updateTerminalSetting("fontFamily", value: newFamily.cssFontFamily)
+                    }
+                    .onChange(of: settings.terminalCursorStyle) { newStyle in
+                        // Update cursor style via JavaScript
+                        applyCursorStyle(newStyle)
+                    }
+                    .onChange(of: settings.terminalScrollBufferSize) { newSize in
+                        // Update scroll buffer size via JavaScript
+                        updateTerminalSetting("scrollback", value: String(newSize))
+                    }
+                    .onChange(of: settings.terminalKeepDisplayActive) { newValue in
+                        // Update keep display active via JavaScript
+                        updateTerminalSetting("disableStdin", value: "false")
+                        forceEnableStdin()
+                    }
+        }
+    }
+
+    private func setupTerminal() {
+        // Setup terminal with SSH shell
+        terminalHolder.view
+            .setupBufferChain { buffer in
+                // Handle user input from terminal
+                manager.appendToInputBuffer(buffer)
+            }
+            .setupTitleChain { title in
+                print("Terminal title: \(title)")
+            }
+            .setupBellChain {
+                // Bell notification
+                NSSound.beep()
+            }
+            .setupSizeChain { size in
+                print("Terminal size: \(size)")
+            }
+
+        // Apply initial JS settings only after the embedded xterm is really ready
+        waitForTerminalReady {
+            injectEmbeddedFontsIfNeeded()
+            applyInitialTerminalSettings()
+            // When the terminal is ready and the connection is up, ensure focus and input are enabled
+            if manager.isConnected {
+                updateTerminalSetting("disableStdin", value: "false")
+                forceEnableStdin()
+                focusTerminal()
+            }
+        }
+
+        // Do not start interactive shell here — wait until manager reports connected.
+    }
+    
+    private func setTerminalTheme() {
+        // Try to set terminal theme based on user settings
+        _ = setTerminalThemeInternal()
+    }
+    
+    private func setTerminalThemeInternal() -> Bool {
+        let webView = terminalWKWebView
+        
+        let bgColor = settings.terminalTheme.backgroundColor
+        let textColor = settings.terminalTheme.textColor
+        
+        // Convert color to RGB colorspace if needed
+        let rgbColor = bgColor.usingColorSpace(.deviceRGB) ?? bgColor
+        
+        let red = Int(rgbColor.redComponent * 255)
+        let green = Int(rgbColor.greenComponent * 255)
+        let blue = Int(rgbColor.blueComponent * 255)
+        let hexBgColor = String(format: "#%02X%02X%02X", red, green, blue)
+        
+        // Set terminal theme via JavaScript
+        let js = """
+        (function() {
+            try {
+                if (!window.term || !window.term.options) {
+                    console.warn('setTerminalTheme: term/options not ready');
+                    return;
+                }
+                window.term.options.theme = {
+                    background: '\(hexBgColor)',
+                    foreground: '\(textColor)',
+                    cursor: '\(textColor)',
+                    cursorAccent: '\(hexBgColor)'
+                };
+                window.term.refresh(0, window.term.rows - 1);
+            } catch (e) {
+                console.error('setTerminalTheme failed:', e);
+            }
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: { _, error in
+            if let error = error {
+                print("Failed to set terminal theme: \(error)")
+            } else {
+                print("Terminal theme set: \(settings.terminalTheme.rawValue), background=\(hexBgColor), foreground=\(textColor)")
+            }
+        })
+        return true
+    }
+    
+    private func updateTerminalSetting(_ setting: String, value: String) {
+        // Update terminal setting via JavaScript
+        _ = setTerminalSettingInternal(setting: setting, value: value)
+    }
+
+    private func setTerminalSettingInternal(setting: String, value: String) -> Bool {
+        let webView = terminalWKWebView
+
+        // Prepare a JS-safe representation of the value.
+        // For numeric settings like scrollback we pass the raw value,
+        // for others we serialize the string to a JSON string literal so
+        // embedded quotes (e.g. "'Menlo', monospace") are correctly escaped.
+        let jsValue: String
+        if setting == "scrollback" || setting == "fontSize" {
+            jsValue = value
+        } else if let data = try? JSONEncoder().encode(value),
+                  let jsonString = String(data: data, encoding: .utf8) {
+            // jsonString is a properly quoted JS string literal, e.g. "\"'Menlo', monospace\""
+            jsValue = jsonString
+        } else {
+            // Fallback: escape single quotes and wrap
+            let escaped = value.replacingOccurrences(of: "'", with: "\\'")
+            jsValue = "'\(escaped)'"
+        }
+
+        // Set terminal setting via JavaScript
+        let js = """
+        (function() {
+            try {
+                if (!window.term || !window.term.options) {
+                    console.warn('setTerminalSetting: term/options not ready');
+                    return;
+                }
+                window.term.options.\(setting) = \(jsValue);
+                window.term.refresh(0, window.term.rows - 1);
+            } catch (e) {
+                console.error('setTerminalSetting failed:', e);
+            }
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: { _, error in
+            if let error = error {
+                print("Failed to set terminal \(setting): \(error)")
+            } else {
+                print("Terminal \(setting) set to: \(value)")
+            }
+        })
+        return true
+    }
+
+    private func setTerminalThemeWithRetry(maxRetries: Int, delay: TimeInterval) {
+        var retryCount = 0
+        
+        func attempt() {
+            if setTerminalThemeInternal() {
+                // Success
+                return
+            }
+            
+            retryCount += 1
+            if retryCount < maxRetries {
+                // Increase delay with each retry
+                let currentDelay = delay * Double(retryCount)
+                DispatchQueue.main.asyncAfter(deadline: .now() + currentDelay) {
+                    attempt()
+                }
+            } else {
+                print("Failed to set terminal theme after \(maxRetries) attempts")
+            }
+        }
+        
+        attempt()
+    }
+
+    private func focusTerminal() {
+        let now = Date()
+        if now.timeIntervalSince(lastTerminalFocusAt) < 0.4 { return }
+        lastTerminalFocusAt = now
+        print("TerminalView: Attempting to focus terminal")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            self.focusTerminalInternal(retryCount: 0, maxRetries: 10)
+        }
+    }
+
+    private func focusTerminalInternal(retryCount: Int, maxRetries: Int) {
+        let webView = terminalWKWebView
+        guard let window = webView.window else {
+            print("TerminalView: WebView noch ohne Fenster (attempt \(retryCount + 1)/\(maxRetries))")
+            if retryCount < maxRetries {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.focusTerminalInternal(retryCount: retryCount + 1, maxRetries: maxRetries)
+                }
+            }
+            return
+        }
+
+        if !TerminalKeyboardBridge.isFirstResponderRelated(to: webView, window: window) {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(webView)
+        }
+
+        let js = """
+        if (window.term) {
+            try {
+                window.term.options.disableStdin = false;
+                window.term.focus();
+                if (window.term.textarea) {
+                    window.term.textarea.focus();
+                }
+            } catch(e) {
+                console.error('Failed to focus terminal:', e);
+            }
+        }
+        """
+
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                print("TerminalView: JavaScript focus error: \(error)")
+            }
+        }
+    }
+
+    private func forceEnableStdin() {
+        let webView = terminalWKWebView
+        let js = """
+        (function() {
+            try {
+                if (window.term && window.term.options) {
+                    window.term.options.disableStdin = false;
+                    if (window.term.textarea) { window.term.textarea.removeAttribute('readonly'); }
+                    console.log('forceEnableStdin: disableStdin=' + window.term.options.disableStdin);
+                }
+            } catch (e) {
+                console.error('forceEnableStdin failed:', e);
+            }
+        })();
+        """
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                print("forceEnableStdin JS error: \(error)")
+            }
+        }
+    }
+
+    private func waitForTerminalReady(maxRetries: Int = 20, delay: TimeInterval = 0.2, onReady: @escaping () -> Void) {
+        waitForTerminalReady(attempt: 0, maxRetries: maxRetries, delay: delay, onReady: onReady)
+    }
+
+    private func waitForTerminalReady(attempt: Int, maxRetries: Int, delay: TimeInterval, onReady: @escaping () -> Void) {
+        let webView = terminalWKWebView
+
+        let readyJS = """
+        (function() {
+            try {
+                return !!(window.term && window.term.options);
+            } catch (e) {
+                return false;
+            }
+        })();
+        """
+
+        webView.evaluateJavaScript(readyJS) { result, error in
+            if let ready = result as? Bool, ready {
+                onReady()
+            } else if attempt < maxRetries {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    self.waitForTerminalReady(attempt: attempt + 1, maxRetries: maxRetries, delay: delay, onReady: onReady)
+                }
+            } else {
+                print("TerminalView: terminal JS not ready after \(maxRetries) attempts")
+                if let error = error {
+                    print("TerminalView: readiness check error: \(error)")
+                }
+            }
+        }
+    }
+
+    private func applyInitialTerminalSettings() {
+        let settings = AppSettings.shared
+        updateTerminalSetting("fontSize", value: String(settings.terminalFontSize))
+        updateTerminalSetting("fontFamily", value: settings.terminalFontFamily.cssFontFamily)
+        applyCursorStyle(settings.terminalCursorStyle)
+        updateTerminalSetting("scrollback", value: String(settings.terminalScrollBufferSize))
+        updateTerminalSetting("disableStdin", value: "false")
+        forceEnableStdin()
+        setTerminalTheme()
+    }
+
+    private func applyCursorStyle(_ style: TerminalCursorStyle) {
+        let webView = terminalWKWebView
+        let mapping = cursorStyleMapping(style)
+        let js = """
+        (function() {
+            try {
+                if (!window.term || !window.term.options) {
+                    console.warn('cursorStyle: term/options not ready');
+                    return;
+                }
+                window.term.options.cursorStyle = '\(mapping.style)';
+                window.term.options.cursorBlink = \(mapping.blink ? "true" : "false");
+                window.term.refresh(0, window.term.rows - 1);
+            } catch (e) {
+                console.error('cursorStyle failed:', e);
+            }
+        })();
+        """
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                print("Failed to set cursor style: \(error)")
+            } else {
+                print("Terminal cursor style set: \(style.rawValue) -> style=\(mapping.style), blink=\(mapping.blink)")
+            }
+        }
+    }
+
+    private func cursorStyleMapping(_ style: TerminalCursorStyle) -> (style: String, blink: Bool) {
+        switch style {
+        case .blinkBar:
+            return ("bar", true)
+        case .blinkBlock:
+            return ("block", true)
+        case .steadyBlock:
+            return ("block", false)
+        case .blinkUnderline:
+            return ("underline", true)
+        case .steadyUnderline:
+            return ("underline", false)
+        case .steadyBar:
+            return ("bar", false)
+        }
+    }
+
+    private func injectEmbeddedFontsIfNeeded() {
+        guard !terminalHolder.fontsInjected else { return }
+        terminalHolder.fontsInjected = true
+        injectEmbeddedFonts()
+    }
+
+    private func injectEmbeddedFonts() {
+        let webView = terminalWKWebView
+
+        let fonts = embeddedFonts()
+        var cssParts: [String] = []
+
+        for font in fonts {
+            guard let data = loadFontData(named: font.fileName, ext: font.ext) else {
+                print("TerminalView: Font-Datei nicht gefunden: \(font.fileName).\(font.ext)")
+                continue
+            }
+            let base64 = data.base64EncodedString()
+            let css = """
+            @font-face {
+                font-family: '\(font.cssName)';
+                src: url(data:\(font.mime);base64,\(base64)) format('\(font.format)');
+                font-weight: 400;
+                font-style: normal;
+                font-display: swap;
+            }
+            """
+            cssParts.append(css)
+        }
+
+        let cssString = cssParts.joined(separator: "\n")
+        guard let cssData = try? JSONEncoder().encode(cssString),
+              let cssLiteral = String(data: cssData, encoding: .utf8) else {
+            print("TerminalView: CSS-Encoding für eingebettete Fonts fehlgeschlagen")
+            return
+        }
+
+        let js = """
+        (function() {
+            try {
+                var css = \(cssLiteral);
+                var styleId = 'xterm-embedded-fonts';
+                var style = document.getElementById(styleId);
+                if (!style) {
+                    style = document.createElement('style');
+                    style.id = styleId;
+                    document.head.appendChild(style);
+                }
+                style.textContent = css;
+            } catch (e) {
+                console.error('injectEmbeddedFonts failed:', e);
+            }
+        })();
+        """
+
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                print("TerminalView: Font-Injektion fehlgeschlagen: \(error)")
+            } else {
+                print("TerminalView: Eingebettete Terminal-Fonts injiziert")
+            }
+        }
+    }
+
+    private func loadFontData(named name: String, ext: String) -> Data? {
+        let bundle = Bundle.module
+        if let url = bundle.url(forResource: name, withExtension: ext, subdirectory: "Resources/Fonts") {
+            return try? Data(contentsOf: url)
+        }
+        if let url = bundle.url(forResource: name, withExtension: ext) {
+            return try? Data(contentsOf: url)
+        }
+        return nil
+    }
+
+    private struct EmbeddedFont {
+        let cssName: String
+        let fileName: String
+        let ext: String
+        let mime: String
+        let format: String
+    }
+
+    private func embeddedFonts() -> [EmbeddedFont] {
+        return [
+            EmbeddedFont(cssName: "Cascadia Code", fileName: "CascadiaCode", ext: "woff2", mime: "font/woff2", format: "woff2"),
+            EmbeddedFont(cssName: "Fira Code", fileName: "FiraCode-Regular", ext: "woff2", mime: "font/woff2", format: "woff2"),
+            EmbeddedFont(cssName: "JetBrains Mono", fileName: "JetBrainsMono-Regular", ext: "woff2", mime: "font/woff2", format: "woff2"),
+            EmbeddedFont(cssName: "Source Code Pro", fileName: "SourceCodePro-Regular", ext: "ttf", mime: "font/ttf", format: "truetype"),
+            EmbeddedFont(cssName: "Ubuntu Mono", fileName: "UbuntuMono-Regular", ext: "ttf", mime: "font/ttf", format: "truetype")
+        ]
+    }
+}
+
+class TerminalHolder: ObservableObject {
+    let view = STerminalView()
+    var isInitialized = false
+    var fontsInjected = false
+}
+
+struct TerminalView_Previews: PreviewProvider {
+    static var previews: some View {
+        TerminalView(manager: ConnectionManager())
+    }
+}
+
+
