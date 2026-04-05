@@ -84,7 +84,7 @@ struct HatchApp: App {
 
         if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
             let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-            if let build = build, !build.isEmpty {
+            if let build = build, !build.isEmpty, build != version {
                 options[.applicationVersion] = "\(version) (\(build))"
             } else {
                 options[.applicationVersion] = version
