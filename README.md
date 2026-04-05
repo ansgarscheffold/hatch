@@ -6,6 +6,20 @@ The idea behind Hatch is a **simple, native, and polished SSH server manager**: 
 
 ---
 
+## Screenshots
+
+![Hatch screenshot 1](screenshots/screen1.png)
+
+![Hatch screenshot 2](screenshots/screen2.png)
+
+![Hatch screenshot 3](screenshots/screen3.png)
+
+![Hatch screenshot 4](screenshots/screen4.png)
+
+![Hatch screenshot 5](screenshots/screen5.png)
+
+---
+
 ## Requirements
 
 - **macOS 13 (Ventura)** or later  
