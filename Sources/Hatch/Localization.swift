@@ -279,17 +279,11 @@ struct LocalizedStrings {
     static var aboutCredits: String {
         if isGerman {
             return """
-Hatch ist ein leichtgewichtiges SSH-Tool für macOS mit Serververwaltung, Schlüssel-Management und integriertem Terminal.
-• Server schnell anlegen, organisieren und verbinden
-• SSH-Schlüssel erstellen oder importieren
-• Terminal-Themes, Schriftarten und Cursor-Stile anpassen
+Hatch ist ein schlankes SSH-Tool für macOS: Server und Verbindungen verwaltest du an einem Ort, SSH-Schlüssel legst du an oder importierst sie, und im integrierten Terminal passt du Themes, Schriftarten und Cursor-Stile an – alles ohne überladene Oberfläche.
 """
         } else {
             return """
-Hatch is a lightweight SSH tool for macOS with server management, key handling, and an integrated terminal.
-• Quickly add, organize, and connect to servers
-• Create or import SSH keys
-• Tweak terminal themes, fonts, and cursor styles
+Hatch is a streamlined SSH tool for macOS: manage servers and connections in one place, create or import SSH keys, and use the built-in terminal with customizable themes, fonts, and cursor styles—without a cluttered interface.
 """
         }
     }

@@ -53,16 +53,24 @@ final class TerminalKeyboardBridge: ObservableObject {
             guard let self = self,
                   isTerminalActive(),
                   let wv = self.webView,
-                  wv.window != nil
+                  let myWindow = wv.window
             else { return event }
-            guard let win = event.window, win === wv.window, win.isKeyWindow else { return event }
-            if Self.isFirstResponderRelated(to: wv, window: win) {
+            // SwiftUI liefert keyDown oft mit event.window == nil; dann würde die Bridge nie greifen.
+            guard myWindow.isKeyWindow else { return event }
+            if let ew = event.window, ew !== myWindow {
                 return event
             }
-            if Self.windowHasNativeTextEditingFocus(win) {
+            if Self.isFirstResponderRelated(to: wv, window: myWindow) {
                 return event
             }
-            win.makeFirstResponder(wv)
+            if Self.windowHasNativeTextEditingFocus(myWindow) {
+                return event
+            }
+            // Anderer Tab / andere WKWebView im gleichen Fenster hat Fokus — nicht umhängen.
+            if let focusedWK = Self.enclosingWKWebView(startingFrom: myWindow.firstResponder), focusedWK !== wv {
+                return event
+            }
+            myWindow.makeFirstResponder(wv)
             // Synchron: async kann Events unter WebKit verlieren; der Monitor läuft ohnehin auf dem Main-Thread.
             wv.keyDown(with: event)
             return nil
@@ -100,6 +108,18 @@ final class TerminalKeyboardBridge: ObservableObject {
             c = cls.superclass()
         }
         return false
+    }
+
+    /// Liefert die WKWebView, in deren View-Hierarchie der First Responder liegt (sonst nil).
+    private static func enclosingWKWebView(startingFrom responder: NSResponder?) -> WKWebView? {
+        var view: NSView? = responder as? NSView
+        while let v = view {
+            if let wk = v as? WKWebView {
+                return wk
+            }
+            view = v.superview
+        }
+        return nil
     }
 }
 
